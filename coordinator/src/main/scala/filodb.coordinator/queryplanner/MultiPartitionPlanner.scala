@@ -7,6 +7,7 @@ import scala.collection.concurrent.{Map => ConcurrentMap}
 import scala.jdk.CollectionConverters._
 
 import com.typesafe.scalalogging.StrictLogging
+
 import io.grpc.ManagedChannel
 
 import filodb.coordinator.queryplanner.LogicalPlanUtils._
