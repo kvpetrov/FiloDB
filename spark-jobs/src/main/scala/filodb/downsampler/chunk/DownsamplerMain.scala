@@ -32,6 +32,16 @@ class DefaultSparkSessionFactory extends SparkSessionFactory {
   }
 }
 
+trait ChunkPersistor {
+  def persist(downsampledChunks: sql.DataFrame, batchDownsampler: BatchDownsampler): Unit
+}
+
+class DefaultChunkPersistor extends ChunkPersistor {
+  override def persist(downsampledChunks: DataFrame, batchDownsampler: BatchDownsampler): Unit = {
+    batchDownsampler.persistDownsampledChunks(downsampledChunks)
+  }
+}
+
 /**
   *
   * Goal: Downsample all real-time data.
@@ -181,6 +191,27 @@ class Downsampler(settings: DownsamplerSettings) extends Serializable {
     } else {
       rdd.foreach(_ => {})
     }
+
+//    DownsamplerContext.dsLogger.info(s"CHUNKSDF: ${chunkRows.collect()}")
+    val chunkRows = rdd.map(x => x._2).flatMap(x => x)
+    val schema = StructType(Seq(
+      StructField("res", StringType, true),
+      StructField("partition", BinaryType, true),
+      StructField("chunkid", LongType, true),
+      StructField("info", BinaryType, true),
+      StructField("chunks", ArrayType(BinaryType), true),
+      StructField("ingestionTime", LongType, true),
+      StructField("startTime", LongType, true),
+      StructField("index_info", BinaryType, true),
+    ))
+    val chunksDf = spark.createDataFrame(chunkRows, schema)
+    DownsamplerContext.dsLogger.info(s"CHUNKSDF: ${chunksDf.show()}")
+
+    val persistor = Class.forName(settings.chunksPersistor)
+      .getDeclaredConstructor()
+      .newInstance()
+      .asInstanceOf[ChunkPersistor]
+      .persist(chunksDf, batchDownsampler)
 
     DownsamplerContext.dsLogger.info(s"Chunk Downsampling Driver completed successfully for downsample period " +
       s"$downsamplePeriodStr")
