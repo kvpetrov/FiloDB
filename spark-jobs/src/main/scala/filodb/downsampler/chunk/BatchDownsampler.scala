@@ -391,4 +391,63 @@ class BatchDownsampler(settings: DownsamplerSettings,
     allRows
   }
 
+//  private def persistDownsampledChunks(downsampledChunksToPersist: MMap[FiniteDuration, Iterator[ChunkSet]]): Int = {
+//    val start = System.currentTimeMillis()
+//    @volatile var numChunks = 0
+//    // write all chunks to cassandra
+//    val writeFut = downsampledChunksToPersist.map { case (res, chunks) =>
+//      // FIXME if listener in chunkset below is not copied + overridden to no-op, we get a SEGV because
+//      // of a bug in either monix's mapAsync or cassandra driver where the future is completed prematurely.
+//      // This causes a race condition between free memory and chunkInfo.id access in updateFlushedId.
+//      val chunksToPersist = chunks.map { c =>
+//        numChunks += 1
+//        c.copy(listener = _ => {})
+//      }
+//      downsampleCassandraColStore.write(downsampleRefsByRes(res),
+//        Observable.fromIteratorUnsafe(chunksToPersist), settings.ttlByResolution(res))
+//    }
+//
+//    writeFut.foreach { fut =>
+//      val response = Await.result(fut, settings.cassWriteTimeout)
+//      DownsamplerContext.dsLogger.debug(s"Got message $response for cassandra write call")
+//      if (response.isInstanceOf[ErrorResponse])
+//        DownsamplerContext.dsLogger.error(s"Got response $response when writing to Cassandra")
+//    }
+//    numDownsampledChunksWritten.increment(numChunks)
+//    downsampleBatchPersistLatency.record(System.currentTimeMillis() - start)
+//    numChunks
+//  }
+
+    def persistDownsampledChunks(downsampledChunksToPersist: DataFrame): Unit = {
+      downsampledChunksToPersist.foreach { row =>
+        val res = Duration.apply(row.getString(0)).asInstanceOf[FiniteDuration]
+        val chunkTable = downsampleCassandraColStore.getOrCreateChunkTable(
+          downsampleRefsByRes(res))
+        import collection.JavaConverters._
+        val chunks = row.getAs[Seq[Array[Byte]]](4).map(ByteBuffer.wrap).toList.asJava
+        val insert = chunkTable.writeChunksCql.bind()
+          .setBytes(0, ByteBuffer.wrap(row.getAs[Array[Byte]](1)))
+          .setLong(1, row.getLong(2))
+          .setBytes(2, ByteBuffer.wrap(row.getAs[Array[Byte]](3)))
+          .setList(3, chunks, classOf[ByteBuffer])
+          .setInt(4, settings.ttlByResolution(res))
+        Await.result(
+          chunkTable.connector.execStmtWithRetries(insert.setConsistencyLevel(ConsistencyLevel.ALL)),
+          Duration.Inf
+        )
+
+        val indexTable = downsampleCassandraColStore
+          .getOrCreateIngestionTimeIndexTable(downsampleRefsByRes(res))
+        val indexInsert = indexTable.writeIndexCql.bind(ByteBuffer.wrap(row.getAs[Array[Byte]](1)),
+          row.getLong(5): java.lang.Long,
+          row.getLong(6): java.lang.Long,
+          ByteBuffer.wrap(row.getAs[Array[Byte]](7)),
+          downsampleCassandraColStore.writeTimeIndexTtlSeconds: java.lang.Integer)
+        Await.result(
+          indexTable.connector.execStmtWithRetries(indexInsert.setConsistencyLevel(ConsistencyLevel.ALL)),
+          Duration.Inf
+        )
+        ()
+      }
+    }
 }

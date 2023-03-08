@@ -64,7 +64,7 @@ extends ColumnStore with CassandraChunkSource with StrictLogging {
   private val indexScanParallelismPerShard =
     Math.min(cassandraConfig.getInt("index-scan-parallelism-per-shard"), Runtime.getRuntime.availableProcessors())
   private val pkByUTNumSplits = cassandraConfig.getInt("pk-by-updated-time-table-num-splits")
-  private val writeTimeIndexTtlSeconds = cassandraConfig.getDuration("write-time-index-ttl", TimeUnit.SECONDS).toInt
+  val writeTimeIndexTtlSeconds = cassandraConfig.getDuration("write-time-index-ttl", TimeUnit.SECONDS).toInt
   private val createTablesEnabled = cassandraConfig.getBoolean("create-tables-enabled")
   private val numTokenRangeSplitsForScans = cassandraConfig.getInt("num-token-range-splits-for-scans")
 
