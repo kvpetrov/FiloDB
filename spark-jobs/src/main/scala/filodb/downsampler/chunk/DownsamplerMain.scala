@@ -2,17 +2,18 @@ package filodb.downsampler.chunk
 
 import java.time.Instant
 import java.time.format.DateTimeFormatter
-
 import kamon.Kamon
 import kamon.metric.MeasurementUnit
-import org.apache.spark.SparkConf
-import org.apache.spark.sql.SparkSession
-
+import org.apache.spark.{SparkConf, sql}
+import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 import filodb.coordinator.KamonShutdownHook
 import filodb.core.binaryrecord2.RecordSchema
 import filodb.core.memstore.PagedReadablePartition
 import filodb.downsampler.DownsamplerContext
 import filodb.memory.format.UnsafeUtils
+import org.apache.spark.sql.types.{ArrayType, BinaryType, LongType, StringType, StructField, StructType}
+
+import scala.collection.mutable.ListBuffer
 
 /**
  * Implement this trait and provide its fully-qualified name as the downsampler config:
@@ -127,6 +128,7 @@ class Downsampler(settings: DownsamplerSettings) extends Serializable {
       s"partitions. Tune num-token-range-splits-for-scans if parallelism is low or latency is high")
 
     KamonShutdownHook.registerShutdownHook()
+
     val rdd = spark.sparkContext
       .makeRDD(splits)
       .mapPartitions { splitIter =>
@@ -143,7 +145,7 @@ class Downsampler(settings: DownsamplerSettings) extends Serializable {
           cassFetchSize = settings.cassFetchSize)
         batchIter
       }
-      .flatMap { rawPartsBatch =>
+      .map { rawPartsBatch =>
         Kamon.init()
         KamonShutdownHook.registerShutdownHook()
         // convert each RawPartData to a ReadablePartition
@@ -153,20 +155,21 @@ class Downsampler(settings: DownsamplerSettings) extends Serializable {
           new PagedReadablePartition(rawPartSchema, shard = 0, partID = 0, partData = rawPart, minResolutionMs = 1)
         }
         // Downsample the data (this step does not contribute the the RDD).
-        if (settings.chunkDownsamplerIsEnabled) {
+        val chunksToPersist = if (settings.chunkDownsamplerIsEnabled) {
           batchDownsampler.downsampleBatch(readablePartsBatch)
-        }
+        } else ListBuffer.empty[Row]
         // Generate the data for the RDD.
         if (settings.exportIsEnabled) {
-          batchExporter.getExportRows(readablePartsBatch)
-        } else Iterator.empty
+          (batchExporter.getExportRows(readablePartsBatch), chunksToPersist)
+        } else (Iterator.empty, chunksToPersist)
       }
 
     // Export the data produced by "getExportRows" above.
     if (settings.exportIsEnabled) {
+      val exportRows = rdd.map(x => x._1).flatMap(x => x)
       val exportStartMs = System.currentTimeMillis()
       // NOTE: toDF(partitionCols: _*) seems buggy
-      spark.createDataFrame(rdd, batchExporter.exportSchema)
+      spark.createDataFrame(exportRows, batchExporter.exportSchema)
         .write
         .format(settings.exportFormat)
         .mode(settings.exportSaveMode)
