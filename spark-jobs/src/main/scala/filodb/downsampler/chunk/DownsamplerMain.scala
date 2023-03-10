@@ -205,12 +205,13 @@ class Downsampler(settings: DownsamplerSettings) extends Serializable {
       StructField("chunkid", LongType, true),
       StructField("info", BinaryType, true),
       StructField("chunks", ArrayType(BinaryType), true),
-      StructField("ingestionTime", LongType, true),
-      StructField("startTime", LongType, true),
+      StructField("ingestion_time", LongType, true),
+      StructField("start_time", LongType, true),
       StructField("index_info", BinaryType, true),
     ))
     val chunksDf = spark.createDataFrame(chunkRows, schema)
     DownsamplerContext.dsLogger.info(s"CHUNKSDF: ${chunksDf.show()}")
+    DownsamplerContext.dsLogger.info(s"${batchDownsampler.settings.downsampleResolutions}")
 
     val persistor = Class.forName(settings.chunksPersistor)
       .getDeclaredConstructor()
