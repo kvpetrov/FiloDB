@@ -37,7 +37,7 @@ import scala.concurrent.Await
   *
   * All of the necessary params for the behavior are loaded from DownsampleSettings.
   */
-class BatchDownsampler(settings: DownsamplerSettings,
+class BatchDownsampler(val settings: DownsamplerSettings,
                        userTimeStart: Long,
                        userTimeEndExclusive: Long) extends Instance with Serializable {
 
@@ -63,7 +63,7 @@ class BatchDownsampler(settings: DownsamplerSettings,
 
   @transient lazy private val session = DownsamplerContext.getOrCreateCassandraSession(settings.cassandraConfig)
 
-  @transient lazy private[downsampler] val downsampleCassandraColStore =
+  @transient lazy val downsampleCassandraColStore =
     new CassandraColumnStore(settings.filodbConfig, DownsamplerContext.readSched, session,
                              true)(DownsamplerContext.writeSched)
 
@@ -110,7 +110,7 @@ class BatchDownsampler(settings: DownsamplerSettings,
   /**
     * Datasets to which we write downsampled data. Keyed by Downsample resolution.
     */
-  @transient lazy private[downsampler] val downsampleRefsByRes = settings.downsampleResolutions
+  @transient lazy val downsampleRefsByRes = settings.downsampleResolutions
                 .zip(settings.downsampledDatasetRefs).toMap
 
   @transient lazy private[downsampler] val shardStats = new TimeSeriesShardStats(rawDatasetRef, -1) // TODO fix
