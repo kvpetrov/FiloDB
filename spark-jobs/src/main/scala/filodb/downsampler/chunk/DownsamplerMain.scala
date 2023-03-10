@@ -2,18 +2,20 @@ package filodb.downsampler.chunk
 
 import java.time.Instant
 import java.time.format.DateTimeFormatter
+
+import scala.collection.mutable.ListBuffer
+
 import kamon.Kamon
 import kamon.metric.MeasurementUnit
-import org.apache.spark.{SparkConf, sql}
+import org.apache.spark.sql.types._
 import org.apache.spark.sql.{DataFrame, Row, SparkSession}
+import org.apache.spark.{SparkConf, sql}
+
 import filodb.coordinator.KamonShutdownHook
 import filodb.core.binaryrecord2.RecordSchema
 import filodb.core.memstore.PagedReadablePartition
 import filodb.downsampler.DownsamplerContext
 import filodb.memory.format.UnsafeUtils
-import org.apache.spark.sql.types.{ArrayType, BinaryType, LongType, StringType, StructField, StructType}
-
-import scala.collection.mutable.ListBuffer
 
 /**
  * Implement this trait and provide its fully-qualified name as the downsampler config:
@@ -33,10 +35,13 @@ class DefaultSparkSessionFactory extends SparkSessionFactory {
 }
 
 trait ChunkPersistor {
+  def init(sparkConf: SparkConf): Unit
   def persist(downsampledChunks: sql.DataFrame, batchDownsampler: BatchDownsampler): Unit
 }
 
 class DefaultChunkPersistor extends ChunkPersistor {
+  override def init(sparkConf: SparkConf): Unit = ()
+
   override def persist(downsampledChunks: DataFrame, batchDownsampler: BatchDownsampler): Unit = {
     batchDownsampler.persistDownsampledChunks(downsampledChunks)
   }
