@@ -83,6 +83,7 @@ object DownsamplerMain extends App {
   val settings = new DownsamplerSettings()
   val d = new Downsampler(settings)
   val sparkConf = new SparkConf(loadDefaults = true)
+    .set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
   d.run(sparkConf)
 }
 
