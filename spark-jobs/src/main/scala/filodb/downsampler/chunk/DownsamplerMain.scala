@@ -98,6 +98,12 @@ class Downsampler(settings: DownsamplerSettings) extends Serializable {
   // See https://medium.com/onzo-tech/serialization-challenges-with-spark-and-scala-a2287cd51c54
   // scalastyle:off method.length
   def run(sparkConf: SparkConf): SparkSession = {
+    val persistor = Class.forName(settings.chunksPersistor)
+      .getDeclaredConstructor()
+      .newInstance()
+      .asInstanceOf[ChunkPersistor]
+
+    persistor.init(sparkConf)
 
     val spark = Class.forName(settings.sparkSessionFactoryClass)
         .getDeclaredConstructor()
@@ -210,15 +216,12 @@ class Downsampler(settings: DownsamplerSettings) extends Serializable {
       StructField("start_time", LongType, true),
       StructField("index_info", BinaryType, true),
     ))
-    val chunksDf = spark.createDataFrame(chunkRows, schema)
-    DownsamplerContext.dsLogger.info(s"CHUNKSDF: ${chunksDf.show()}")
+    val downsampledDf = spark.createDataFrame(chunkRows, schema)
+
+    DownsamplerContext.dsLogger.info(s"CHUNKSDF: ${downsampledDf.show()}")
     DownsamplerContext.dsLogger.info(s"${batchDownsampler.settings.downsampleResolutions}")
 
-    val persistor = Class.forName(settings.chunksPersistor)
-      .getDeclaredConstructor()
-      .newInstance()
-      .asInstanceOf[ChunkPersistor]
-      .persist(chunksDf, batchDownsampler)
+    persistor.persist(downsampledDf, batchDownsampler)
 
     DownsamplerContext.dsLogger.info(s"Chunk Downsampling Driver completed successfully for downsample period " +
       s"$downsamplePeriodStr")
