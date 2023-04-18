@@ -1,1 +1,1 @@
-version in ThisBuild := "sbw-testing-0.9.20.1"
+version in ThisBuild := "0.10.20.1"
