@@ -7,6 +7,7 @@ import scala.collection.mutable.ListBuffer
 
 import kamon.Kamon
 import kamon.metric.MeasurementUnit
+import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 import org.apache.spark.{SparkConf, sql}
@@ -14,6 +15,7 @@ import org.apache.spark.{SparkConf, sql}
 import filodb.coordinator.KamonShutdownHook
 import filodb.core.binaryrecord2.RecordSchema
 import filodb.core.memstore.PagedReadablePartition
+import filodb.core.store.RawPartData
 import filodb.downsampler.DownsamplerContext
 import filodb.memory.format.UnsafeUtils
 
@@ -44,6 +46,39 @@ class DefaultChunkPersistor extends ChunkPersistor {
 
   override def persist(downsampledChunks: DataFrame, batchDownsampler: BatchDownsampler): Unit = {
     batchDownsampler.persistDownsampledChunks(downsampledChunks)
+  }
+}
+
+trait DSPartitionReader {
+  def read(spark: SparkSession, batchDownsampler: BatchDownsampler,
+           ingestionTimeStart: Long, ingestionTimeEnd: Long,
+           userTimeStart: Long, userTimeEndExclusive: Long): RDD[Seq[RawPartData]]
+}
+
+class DefaultDSPartitionReader extends DSPartitionReader {
+  override def read(spark: SparkSession, batchDownsampler: BatchDownsampler,
+                    ingestionTimeStart: Long, ingestionTimeEnd: Long,
+                    userTimeStart: Long, userTimeEndExclusive: Long): RDD[Seq[RawPartData]] = {
+    val splits = batchDownsampler.rawCassandraColStore.getScanSplits(batchDownsampler.rawDatasetRef)
+    val settings = batchDownsampler.settings
+    DownsamplerContext.dsLogger.info(s"Cassandra split size: ${splits.size}. We will have this many spark " +
+      s"partitions. Tune num-token-range-splits-for-scans if parallelism is low or latency is high")
+    spark.sparkContext
+      .makeRDD(splits)
+      .mapPartitions { splitIter =>
+        Kamon.init()
+        KamonShutdownHook.registerShutdownHook()
+        val rawDataSource = batchDownsampler.rawCassandraColStore
+        val batchIter = rawDataSource.getChunksByIngestionTimeRangeNoAsync(
+          datasetRef = batchDownsampler.rawDatasetRef,
+          splits = splitIter, ingestionTimeStart = ingestionTimeStart,
+          ingestionTimeEnd = ingestionTimeEnd,
+          userTimeStart = userTimeStart, endTimeExclusive = userTimeEndExclusive,
+          maxChunkTime = settings.rawDatasetIngestionConfig.storeConfig.maxChunkTime.toMillis,
+          batchSize = settings.batchSize,
+          cassFetchSize = settings.cassFetchSize)
+        batchIter
+      }
   }
 }
 
@@ -145,28 +180,17 @@ class Downsampler(settings: DownsamplerSettings) extends Serializable {
     DownsamplerContext.dsLogger.info(s"To rerun this job add the following spark config: " +
       s""""spark.filodb.downsampler.userTimeOverride": "${java.time.Instant.ofEpochMilli(userTimeInPeriod)}"""")
 
-    val splits = batchDownsampler.rawCassandraColStore.getScanSplits(batchDownsampler.rawDatasetRef)
-    DownsamplerContext.dsLogger.info(s"Cassandra split size: ${splits.size}. We will have this many spark " +
-      s"partitions. Tune num-token-range-splits-for-scans if parallelism is low or latency is high")
-
     KamonShutdownHook.registerShutdownHook()
 
-    val rdd = spark.sparkContext
-      .makeRDD(splits)
-      .mapPartitions { splitIter =>
-        Kamon.init()
-        KamonShutdownHook.registerShutdownHook()
-        val rawDataSource = batchDownsampler.rawCassandraColStore
-        val batchIter = rawDataSource.getChunksByIngestionTimeRangeNoAsync(
-          datasetRef = batchDownsampler.rawDatasetRef,
-          splits = splitIter, ingestionTimeStart = ingestionTimeStart,
-          ingestionTimeEnd = ingestionTimeEnd,
-          userTimeStart = userTimeStart, endTimeExclusive = userTimeEndExclusive,
-          maxChunkTime = settings.rawDatasetIngestionConfig.storeConfig.maxChunkTime.toMillis,
-          batchSize = settings.batchSize,
-          cassFetchSize = settings.cassFetchSize)
-        batchIter
-      }
+    val dsIndexReader = Class.forName(settings.dsIndexReader)
+      .getDeclaredConstructor()
+      .newInstance()
+      .asInstanceOf[DSPartitionReader]
+
+    val sourceDf = dsIndexReader.read(spark, batchDownsampler,
+      ingestionTimeStart, ingestionTimeEnd, userTimeStart, userTimeEndExclusive)
+
+    val rdd = sourceDf
       .map { rawPartsBatch =>
         Kamon.init()
         KamonShutdownHook.registerShutdownHook()
@@ -218,8 +242,8 @@ class Downsampler(settings: DownsamplerSettings) extends Serializable {
     ))
     val downsampledDf = spark.createDataFrame(chunkRows, schema)
 
-    DownsamplerContext.dsLogger.info(s"CHUNKSDF: ${downsampledDf.show()}")
-    DownsamplerContext.dsLogger.info(s"${batchDownsampler.settings.downsampleResolutions}")
+//    DownsamplerContext.dsLogger.info(s"CHUNKSDF: ${downsampledDf.show()}")
+//    DownsamplerContext.dsLogger.info(s"${batchDownsampler.settings.downsampleResolutions}")
 
     persistor.persist(downsampledDf, batchDownsampler)
 

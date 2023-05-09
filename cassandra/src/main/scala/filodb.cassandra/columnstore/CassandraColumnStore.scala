@@ -226,6 +226,27 @@ extends ColumnStore with CassandraChunkSource with StrictLogging {
     }
   }
 
+  def getChunksByPartKey(datasetRef: DatasetRef,
+                         partKeys: Iterator[ByteBuffer],
+                         userTimeStart: Long,
+                         endTimeExclusive: Long,
+                         maxChunkTime: Long,
+                         batchSize: Int): Iterator[Seq[RawPartData]] = {
+    val chunksTable = getOrCreateChunkTable(datasetRef)
+    partKeys.sliding(batchSize, batchSize).map { parts =>
+      logger.debug(s"Querying cassandra for chunks from ${parts.size} partitions userTimeStart=$userTimeStart " +
+        s"endTimeExclusive=$endTimeExclusive maxChunkTime=$maxChunkTime")
+      // This could be more parallel, but decision was made to control parallelism at one place: In spark (via its
+      // parallelism configuration. Revisit if needed later.
+      val start = System.currentTimeMillis()
+      try {
+        chunksTable.readRawPartitionRangeBBNoAsync(parts, userTimeStart - maxChunkTime, endTimeExclusive)
+      } finally {
+        readChunksBatchLatency.record(System.currentTimeMillis() - start)
+      }
+    }
+  }
+
   /**
    * Copy a range of partitionKey records to a target ColumnStore, for performing disaster recovery or
    * backfills.

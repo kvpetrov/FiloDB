@@ -67,7 +67,7 @@ class BatchDownsampler(val settings: DownsamplerSettings,
     new CassandraColumnStore(settings.filodbConfig, DownsamplerContext.readSched, session,
                              true)(DownsamplerContext.writeSched)
 
-  @transient lazy private[downsampler] val rawCassandraColStore =
+  @transient lazy val rawCassandraColStore =
     new CassandraColumnStore(settings.filodbConfig, DownsamplerContext.readSched, session,
                              false)(DownsamplerContext.writeSched)
 
@@ -101,7 +101,7 @@ class BatchDownsampler(val settings: DownsamplerSettings,
   /**
     * Raw dataset from which we downsample data
     */
-  @transient lazy private[downsampler] val rawDatasetRef = DatasetRef(settings.rawDatasetName)
+  @transient lazy val rawDatasetRef = DatasetRef(settings.rawDatasetName)
 
   // FIXME * 4 exists to workaround an issue where we see under-allocation for metaspan due to
   // possible mis-calculation of max block meta size.
