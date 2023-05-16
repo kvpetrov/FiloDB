@@ -133,12 +133,16 @@ class Downsampler(settings: DownsamplerSettings) extends Serializable {
   // See https://medium.com/onzo-tech/serialization-challenges-with-spark-and-scala-a2287cd51c54
   // scalastyle:off method.length
   def run(sparkConf: SparkConf): SparkSession = {
-    val persistor = Class.forName(settings.chunksPersistor)
-      .getDeclaredConstructor()
-      .newInstance()
-      .asInstanceOf[ChunkPersistor]
-
-    persistor.init(sparkConf)
+    val persistor: ChunkPersistor = if (settings.shouldUseChunksPersistor) {
+      val instance = Class.forName(settings.chunksPersistor)
+        .getDeclaredConstructor()
+        .newInstance()
+        .asInstanceOf[ChunkPersistor]
+      instance.init(sparkConf)
+      instance
+    } else {
+      null
+    }
 
     val spark = Class.forName(settings.sparkSessionFactoryClass)
         .getDeclaredConstructor()
@@ -228,24 +232,22 @@ class Downsampler(settings: DownsamplerSettings) extends Serializable {
       rdd.foreach(_ => {})
     }
 
-//    DownsamplerContext.dsLogger.info(s"CHUNKSDF: ${chunkRows.collect()}")
-    val chunkRows = rdd.map(x => x._2).flatMap(x => x)
-    val schema = StructType(Seq(
-      StructField("res", StringType, true),
-      StructField("partition", BinaryType, true),
-      StructField("chunkid", LongType, true),
-      StructField("info", BinaryType, true),
-      StructField("chunks", ArrayType(BinaryType), true),
-      StructField("ingestion_time", LongType, true),
-      StructField("start_time", LongType, true),
-      StructField("index_info", BinaryType, true),
-    ))
-    val downsampledDf = spark.createDataFrame(chunkRows, schema)
-
-//    DownsamplerContext.dsLogger.info(s"CHUNKSDF: ${downsampledDf.show()}")
-//    DownsamplerContext.dsLogger.info(s"${batchDownsampler.settings.downsampleResolutions}")
-
-    persistor.persist(downsampledDf, batchDownsampler)
+    if (settings.shouldUseChunksPersistor) {
+      val chunkRows = rdd.map(x => x._2).flatMap(x => x)
+      val schema = StructType(Seq(
+        StructField("res", StringType, true),
+        StructField("partition", BinaryType, true),
+        StructField("chunkid", LongType, true),
+        StructField("info", BinaryType, true),
+        StructField("chunks", ArrayType(BinaryType), true),
+        StructField("ingestion_time", LongType, true),
+        StructField("start_time", LongType, true),
+        StructField("index_info", BinaryType, true),
+      ))
+      val downsampledDf = spark.createDataFrame(chunkRows, schema)
+      downsampledDf.cache()
+      persistor.persist(downsampledDf, batchDownsampler)
+    }
 
     DownsamplerContext.dsLogger.info(s"Chunk Downsampling Driver completed successfully for downsample period " +
       s"$downsamplePeriodStr")

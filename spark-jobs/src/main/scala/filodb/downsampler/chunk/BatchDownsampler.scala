@@ -1,15 +1,17 @@
 package filodb.downsampler.chunk
 
 import com.datastax.driver.core.ConsistencyLevel
-import filodb.cassandra.Util.toBuffer
 
+import filodb.cassandra.Util.toBuffer
 import scala.collection.mutable.{ArrayBuffer, ListBuffer, Map => MMap}
 import scala.concurrent.duration.{Duration, FiniteDuration}
+
 import kamon.Kamon
 import kamon.metric.MeasurementUnit
 import spire.syntax.cfor._
+
 import filodb.cassandra.columnstore.CassandraColumnStore
-import filodb.core.{DatasetRef, Instance}
+import filodb.core.{DatasetRef, ErrorResponse, Instance}
 import filodb.core.binaryrecord2.{RecordBuilder, RecordSchema}
 import filodb.core.downsample._
 import filodb.core.memstore._
@@ -20,9 +22,11 @@ import filodb.memory.{BinaryRegionLarge, MemFactory}
 import filodb.memory.format.UnsafeUtils
 import filodb.query.exec.UnknownSchemaQueryErr
 import org.apache.spark.sql.{DataFrame, Row}
-
 import java.nio.ByteBuffer
+
 import scala.concurrent.Await
+
+import monix.reactive.Observable
 
 /**
   * This object maintains state during the processing of a batch of TSPartitions to downsample. Namely
@@ -164,7 +168,11 @@ class BatchDownsampler(val settings: DownsamplerSettings,
           DownsamplerContext.dsLogger.warn(s"Skipping series with unknown schema ID $rawSchemaId")
         }
       }
-      chunksToPersist = getDownsampledChunksAsList(downsampledChunksToPersist)
+      if (settings.shouldUseChunksPersistor) {
+        chunksToPersist = getDownsampledChunksAsList(downsampledChunksToPersist)
+      } else {
+        persistDownsampledChunks(downsampledChunksToPersist)
+      }
     } catch { case e: Exception =>
       numBatchesFailed.increment()
       throw e // will be logged by spark
@@ -391,34 +399,38 @@ class BatchDownsampler(val settings: DownsamplerSettings,
     allRows
   }
 
-//  private def persistDownsampledChunks(downsampledChunksToPersist: MMap[FiniteDuration, Iterator[ChunkSet]]): Int = {
-//    val start = System.currentTimeMillis()
-//    @volatile var numChunks = 0
-//    // write all chunks to cassandra
-//    val writeFut = downsampledChunksToPersist.map { case (res, chunks) =>
-//      // FIXME if listener in chunkset below is not copied + overridden to no-op, we get a SEGV because
-//      // of a bug in either monix's mapAsync or cassandra driver where the future is completed prematurely.
-//      // This causes a race condition between free memory and chunkInfo.id access in updateFlushedId.
-//      val chunksToPersist = chunks.map { c =>
-//        numChunks += 1
-//        c.copy(listener = _ => {})
-//      }
-//      downsampleCassandraColStore.write(downsampleRefsByRes(res),
-//        Observable.fromIteratorUnsafe(chunksToPersist), settings.ttlByResolution(res))
-//    }
-//
-//    writeFut.foreach { fut =>
-//      val response = Await.result(fut, settings.cassWriteTimeout)
-//      DownsamplerContext.dsLogger.debug(s"Got message $response for cassandra write call")
-//      if (response.isInstanceOf[ErrorResponse])
-//        DownsamplerContext.dsLogger.error(s"Got response $response when writing to Cassandra")
-//    }
-//    numDownsampledChunksWritten.increment(numChunks)
-//    downsampleBatchPersistLatency.record(System.currentTimeMillis() - start)
-//    numChunks
-//  }
+  /**
+   * Persist chunks in `downsampledChunksToPersist` to Cassandra.
+   */
+  private def persistDownsampledChunks(downsampledChunksToPersist: MMap[FiniteDuration,
+    Iterator[ChunkSet]]): ListBuffer[Row] = {
+    val start = System.currentTimeMillis()
+    @volatile var numChunks = 0
+    // write all chunks to cassandra
+    val writeFut = downsampledChunksToPersist.map { case (res, chunks) =>
+      // FIXME if listener in chunkset below is not copied + overridden to no-op, we get a SEGV because
+      // of a bug in either monix's mapAsync or cassandra driver where the future is completed prematurely.
+      // This causes a race condition between free memory and chunkInfo.id access in updateFlushedId.
+      val chunksToPersist = chunks.map { c =>
+        numChunks += 1
+        c.copy(listener = _ => {})
+      }
+      downsampleCassandraColStore.write(downsampleRefsByRes(res),
+        Observable.fromIteratorUnsafe(chunksToPersist), settings.ttlByResolution(res))
+    }
 
-    def persistDownsampledChunks(downsampledChunksToPersist: DataFrame): Unit = {
+    writeFut.foreach { fut =>
+      val response = Await.result(fut, settings.cassWriteTimeout)
+      DownsamplerContext.dsLogger.debug(s"Got message $response for cassandra write call")
+      if (response.isInstanceOf[ErrorResponse])
+        DownsamplerContext.dsLogger.error(s"Got response $response when writing to Cassandra")
+    }
+    numDownsampledChunksWritten.increment(numChunks)
+    downsampleBatchPersistLatency.record(System.currentTimeMillis() - start)
+    ListBuffer.empty[Row]
+  }
+
+  def persistDownsampledChunks(downsampledChunksToPersist: DataFrame): Unit = {
       downsampledChunksToPersist.foreach { row =>
         val res = Duration.apply(row.getString(0)).asInstanceOf[FiniteDuration]
         val chunkTable = downsampleCassandraColStore.getOrCreateChunkTable(
