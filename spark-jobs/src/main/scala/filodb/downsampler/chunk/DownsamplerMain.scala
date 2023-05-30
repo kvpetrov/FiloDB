@@ -245,7 +245,6 @@ class Downsampler(settings: DownsamplerSettings) extends Serializable {
         StructField("index_info", BinaryType, true),
       ))
       val downsampledDf = spark.createDataFrame(chunkRows, schema)
-      downsampledDf.cache()
       persistor.persist(downsampledDf, batchDownsampler)
     }
 
