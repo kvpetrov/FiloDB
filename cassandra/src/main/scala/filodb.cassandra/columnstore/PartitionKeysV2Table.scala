@@ -37,7 +37,8 @@ sealed class PartitionKeysV2Table(val dataset: DatasetRef,
     s"INSERT INTO ${tableString} (shard, bucket, partKey, startTime, endTime) " +
       s"VALUES (?, ?, ?, ?, ?) USING TTL ?"
 
-  logger.info("writePartitionCql for V2 table: ")
+  logger.info("writePartitionCql for V2 table: " + writePartitionCqlStr)
+  
   private lazy val writePartitionCql = session.prepare(writePartitionCqlStr)
       .setConsistencyLevel(writeConsistencyLevel)
       .setIdempotent(true)
