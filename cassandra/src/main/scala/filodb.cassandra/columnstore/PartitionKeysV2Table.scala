@@ -33,9 +33,12 @@ sealed class PartitionKeysV2Table(val dataset: DatasetRef,
        |    PRIMARY KEY ((shard, bucket), partKey)
        |) WITH compression = {'chunk_length_in_kb': '16', 'sstable_compression': '$sstableCompression'}""".stripMargin
 
-  private lazy val writePartitionCql = session.prepare(
-      s"INSERT INTO ${tableString} (shard, bucket, partKey, startTime, endTime) " +
-      s"VALUES (?, ?, ?, ?, ?) USING TTL ?")
+  val writePartitionCqlStr =
+    s"INSERT INTO ${tableString} (shard, bucket, partKey, startTime, endTime) " +
+      s"VALUES (?, ?, ?, ?, ?) USING TTL ?"
+
+  logger.info("writePartitionCql for V2 table: ")
+  private lazy val writePartitionCql = session.prepare(writePartitionCqlStr)
       .setConsistencyLevel(writeConsistencyLevel)
       .setIdempotent(true)
 
