@@ -91,6 +91,7 @@ extends TimeSeriesStore with StrictLogging {
       throw ShardAlreadySetup(ref, shard)
     } else {
       val tsdb : TimeSeriesShard = if (writeDownsampleIndex) {
+        logger.info(s"Created DownsamplableOnDemandPagingShard ${shard}")
         new DownsamplableOnDemandPagingShard(
           ref, schemas, storeConf, numShards, quotaSource, shard,
           ingestionMemFactory, store,
@@ -98,6 +99,7 @@ extends TimeSeriesStore with StrictLogging {
           metastore, partEvictionPolicy, downsample, filodbConfig
         )
       } else {
+        logger.info(s"Created OnDemandPagingShard ${shard}")
         new OnDemandPagingShard(ref, schemas, storeConf, numShards, quotaSource, shard,
           ingestionMemFactory, store, metastore, partEvictionPolicy, filodbConfig)
       }

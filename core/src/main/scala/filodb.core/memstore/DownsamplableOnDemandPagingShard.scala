@@ -64,6 +64,7 @@ class DownsamplableOnDemandPagingShard (
         )
     assertThreadName(IOSchedName)
     val updateHour = System.currentTimeMillis() / 1000 / 60 / 60
+    logger.info(s"Writing part keys to the downsample index for shard ${shardNum} for dataset ${ref}")
     val downsampleResponse : Future[Response] = downsampleStore.writePartKeys(
       dsDatasetRef, shardNum, Observable.fromIteratorUnsafe(partKeyRecords), downsampleTTLSeconds, updateHour, false
     ).map { resp =>
