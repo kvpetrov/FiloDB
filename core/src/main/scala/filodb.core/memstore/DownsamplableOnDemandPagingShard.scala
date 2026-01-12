@@ -13,6 +13,7 @@ import filodb.core.metadata.Schemas
 import filodb.core.store.{ColumnStore, MetaStore, PartKeyRecord, StoreConfig}
 import filodb.memory.NativeMemoryManager
 
+
 class DownsamplableOnDemandPagingShard (
   ref: DatasetRef,
   schemas: Schemas,
@@ -40,12 +41,11 @@ class DownsamplableOnDemandPagingShard (
     evictionPolicy: PartitionEvictionPolicy,
     filodbConfig: Config
 ) {
-
   val downsampleTTLSeconds = downsampleConfig.ttls.last.toSeconds //ttlByResolution(highestDSResolution),
   val dsDatasetRef = downsampleConfig.downsampleDatasetRefs(ref.dataset).last
-
   import FiloSchedulers._
 
+  // scalastyle:off method.length
   override def writeDirtyPartKeys(flushGroup: FlushGroup): Future[Response] = {
     val rawResponse : Future[Response] = super.writeDirtyPartKeys(flushGroup)
     val partKeyRecords: Iterator[filodb.core.store.PartKeyRecord] =
@@ -64,7 +64,10 @@ class DownsamplableOnDemandPagingShard (
         )
     assertThreadName(IOSchedName)
     val updateHour = System.currentTimeMillis() / 1000 / 60 / 60
-    logger.info(s"Writing part keys to the downsample index for shard ${shardNum} for dataset ${ref}")
+    logger.info(
+      s"Writing ${flushGroup.dirtyPartsToFlush.length} " +
+      s"part keys to the downsample index for shard ${shardNum} for dataset ${ref}"
+    )
     val downsampleResponse : Future[Response] = downsampleStore.writePartKeys(
       dsDatasetRef, shardNum, Observable.fromIteratorUnsafe(partKeyRecords), downsampleTTLSeconds, updateHour, false
     ).map { resp =>
@@ -72,6 +75,9 @@ class DownsamplableOnDemandPagingShard (
         logger.info(s"Finished flush of partKeys to downsample numPartKeys=${flushGroup.dirtyPartsToFlush.length}" +
           s" resp=$resp for dataset=$ref shard=$shardNum")
         shardStats.numDirtyDownsamplePartKeysFlushed.increment(flushGroup.dirtyPartsToFlush.length)
+      } else {
+        logger.info(s"flushGroup.dirtyPartsToFlush size is ${flushGroup.dirtyPartsToFlush.length}" +
+          s" resp=$resp for dataset=$ref shard=$shardNum")
       }
       resp
     }.recover { case e =>
