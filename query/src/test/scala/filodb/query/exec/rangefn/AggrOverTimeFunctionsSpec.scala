@@ -12,7 +12,6 @@ import filodb.core.{MetricsTestData, QueryTimeoutException, TestData, MachineMet
 import filodb.core.memstore.{TimeSeriesPartition, TimeSeriesPartitionSpec, WriteBufferPool}
 import filodb.core.query._
 import filodb.core.store.AllChunkScan
-import filodb.core.MachineMetricsData.defaultPartKey
 import filodb.memory._
 import filodb.memory.data.ChunkMap
 import filodb.memory.format.{TupleRowReader, vectors => bv}
@@ -39,6 +38,23 @@ trait RawDataWindowingSpec extends AnyFunSpec with Matchers with BeforeAndAfter 
   protected val ingestBlockHolder2 = new BlockMemFactory(blockStore, downsampleSchema.data.blockMetaSize,
                                       MMD.dummyContext, true)
   protected val tsBufferPool2 = new WriteBufferPool(TestData.nativeMem, downsampleSchema.data, storeConf)
+
+  // Delta (non-cumulative) counter infrastructure — same blockMetaSize as timeseriesDatasetWithMetric
+  protected val deltaTsBufferPool = new WriteBufferPool(TestData.nativeMem,
+                                        deltaTimeseriesDatasetWithMetric.schema.data, storeConf)
+
+  def deltaTimeValueRV(data: Seq[Double],
+                       pubFrequency: Long = pubFreq,
+                       startTS: Long = defaultStartTS): RawDataRangeVector = {
+    val tuples = data.zipWithIndex.map { case (d, t) => (startTS + t * pubFrequency, d) }
+    val part = TimeSeriesPartitionSpec.makePart(0, deltaTimeseriesDatasetWithMetric,
+                                               partKey = defaultPartKey, bufferPool = deltaTsBufferPool)
+    val readers = tuples.map { case (ts, d) => TupleRowReader((Some(ts), Some(d))) }
+    readers.foreach { row => part.ingest(0, row, ingestBlockHolder, createChunkAtFlushBoundary = false,
+      flushIntervalMillis = Option.empty, acceptDuplicateSamples = false) }
+    part.switchBuffers(ingestBlockHolder, encode = true)
+    RawDataRangeVector(null, part, AllChunkScan, Array(0, 1), new AtomicLong(), new AtomicLong(), Long.MaxValue, "query-id")
+  }
 
   after {
     ChunkMap.validateNoSharedLocks(getClass().toString(), true)
@@ -154,7 +170,7 @@ trait RawDataWindowingSpec extends AnyFunSpec with Matchers with BeforeAndAfter 
 
   // Creates a RawDataRangeVector using Prometheus time-value schema and a given chunk size etc.
   def timeValueRVPk(tuples: Seq[(Long, Double)],
-                    partKey: NativePointer = defaultPartKey): RawDataRangeVector = {
+                    partKey: NativePointer = MetricsTestData.defaultPartKey): RawDataRangeVector = {
     val part = TimeSeriesPartitionSpec.makePart(0, timeseriesDatasetWithMetric, partKey, bufferPool = tsBufferPool)
     val readers = tuples.map { case (ts, d) => TupleRowReader((Some(ts), Some(d))) }
     readers.foreach { row => part.ingest(0, row, ingestBlockHolder, createChunkAtFlushBoundary = false,
@@ -367,7 +383,7 @@ class AggrOverTimeFunctionsSpec extends RawDataWindowingSpec {
     val data = (0 until 200).map { i =>
       if ((i+1) % 40 == 0) -2.3d
       else if ((i+1) % 20 == 0) 2.3d
-      else rand.nextDouble()
+      else (i % 9 + 1) * 0.1  // cycles 0.1, 0.2, ..., 0.9; guarantees MAD >= ~0.2
     }
     val rv = timeValueRV(data)
     val rangeParams = RangeParams(100, 20, 500)
@@ -616,7 +632,7 @@ class AggrOverTimeFunctionsSpec extends RawDataWindowingSpec {
       while (iter.hasNext) {
         diffFromMedians.append(Math.abs(iter.next()-medianVal))
       }
-      diffFromMedians.sort(spire.algebra.Order.fromOrdering[Double])
+      java.util.Arrays.sort(diffFromMedians.elems.asInstanceOf[Array[Double]], 0, diffFromMedians.length)
       val (weight, upperIndex, lowerIndex) = QuantileOverTimeFunction.calculateRank(0.5, diffFromMedians.length)
       iter = diffFromMedians.iterator
       diffFromMedians(lowerIndex) * (1 - weight) + diffFromMedians(upperIndex) * weight
@@ -730,7 +746,7 @@ class AggrOverTimeFunctionsSpec extends RawDataWindowingSpec {
 
       val minChunkedIt = chunkedWindowIt(data, rv2, new HoltWintersChunkedFunctionD(params), windowSize, step)
       val aggregated2 = minChunkedIt.map(_.getDouble(1)).toBuffer
-      val res = data.sliding(windowSize, step).map(_.drop(1)).map(holt_winters).toBuffer
+      val res = data.sliding(windowSize, step).map(holt_winters).toBuffer
       for (i <- res.indices) {
         if (res(i).isNaN) {
           println("Inside Nan")
@@ -1911,6 +1927,164 @@ class AggrOverTimeFunctionsSpec extends RawDataWindowingSpec {
         info(s"  ✓ Min constraint applied: $unboundedQuantile clamped to $boundedQuantile")
       }
     }
+  }
+
+  // ---- CumlDeltaTogglerChunkedFunction tests ----
+
+  it("CumlDeltaToggler with increase/sum should route cumulative counter to ChunkedIncreaseFunction " +
+      "and delta counter to SumOverTimeChunkedFunctionD") {
+    // Monotonically increasing data so increase == last - first; delta data sums directly
+    val data = (1 to 120).map(_.toDouble)
+
+    val cumulRV = timeValueRV(data)          // schema has detectDrops=true → cumulative
+    val deltaRV  = deltaTimeValueRV(data)    // schema has no detectDrops   → delta
+
+    // The toggler wraps ChunkedIncreaseFunction (cum) and SumOverTimeChunkedFunctionD (delta)
+    val windowSize = 20
+    val step       = 10
+
+    // Run reference functions directly
+    val directIncreaseIt = chunkedWindowIt(data, cumulRV, new ChunkedIncreaseFunction, windowSize, step)
+    val directIncreaseResults = directIncreaseIt.map(_.getDouble(1)).toBuffer
+
+    val directSumIt = chunkedWindowIt(data, deltaRV, new SumOverTimeChunkedFunctionD(), windowSize, step)
+    val directSumResults = directSumIt.map(_.getDouble(1)).toBuffer
+
+    val toggler = new CumlDeltaTogglerChunkedFunction(new ChunkedIncreaseFunction, new SumOverTimeChunkedFunctionD())
+
+    // Run toggler on cumulative RV — should delegate to ChunkedIncreaseFunction
+    val togglerCumIt = chunkedWindowIt(data, cumulRV, toggler, windowSize, step)
+    val togglerCumIncreaseResults = togglerCumIt.map(_.getDouble(1)).toBuffer
+
+    // Run toggler on delta RV — should delegate to SumOverTimeChunkedFunctionD
+    val togglerDeltaIt = chunkedWindowIt(data, deltaRV, toggler, windowSize, step)
+    val togglerDeltaIncreaseResults = togglerDeltaIt.map(_.getDouble(1)).toBuffer
+
+    togglerCumIncreaseResults shouldEqual directIncreaseResults
+    togglerDeltaIncreaseResults shouldEqual directSumResults
+    // Sanity: the two result sets are different (increase ≠ sum for this data)
+    togglerCumIncreaseResults should not equal togglerDeltaIncreaseResults
+  }
+
+  it("CumlDeltaToggler with rate should route cumulative counter to ChunkedRateFunction " +
+      "and delta counter to RateOverDeltaChunkedFunctionD") {
+    val data = (1 to 120).map(_.toDouble)
+
+    val cumulRV = timeValueRV(data)
+    val deltaRV  = deltaTimeValueRV(data)
+
+    val windowSize = 20
+    val step       = 10
+
+    val directRateCumIt = chunkedWindowIt(data, cumulRV, new ChunkedRateFunction, windowSize, step)
+    val directRateCumResults = directRateCumIt.map(_.getDouble(1)).toBuffer
+
+    val directRateDeltaIt = chunkedWindowIt(data, deltaRV, new RateOverDeltaChunkedFunctionD(), windowSize, step)
+    val directRateDeltaResults = directRateDeltaIt.map(_.getDouble(1)).toBuffer
+
+    val toggler = new CumlDeltaTogglerChunkedFunction(new ChunkedRateFunction, new RateOverDeltaChunkedFunctionD())
+
+    val togglerCumIt = chunkedWindowIt(data, cumulRV, toggler, windowSize, step)
+    val togglerCumResults = togglerCumIt.map(_.getDouble(1)).toBuffer
+
+    val togglerDeltaIt = chunkedWindowIt(data, deltaRV, toggler, windowSize, step)
+    val togglerDeltaResults = togglerDeltaIt.map(_.getDouble(1)).toBuffer
+
+    togglerCumResults shouldEqual directRateCumResults
+    togglerDeltaResults shouldEqual directRateDeltaResults
+    togglerCumResults should not equal togglerDeltaResults
+  }
+
+  it("CumlDeltaToggler with histogram rate should route delta histogram to RateOverDeltaChunkedFunctionH " +
+      "and cumulative histogram to HistRateFunction") {
+    // Delta histogram — histDataset has counter=false and no detectDrops
+    val (deltaData, deltaRV) = histogramRV(numSamples = 50)
+
+    // Cumulative histogram — cumulHistDS has detectDrops=true on count/sum and counter=true on hist
+    val (cumulData, cumulRV) = MMD.cumulHistRV(defaultStartTS, pubFreq, numSamples = 50)
+
+    val windowSize = 10
+    val step       = 5
+
+    // Reference: direct delta histogram rate
+    val directDeltaIt = chunkedWindowItHist(deltaData, deltaRV, new RateOverDeltaChunkedFunctionH(), windowSize, step)
+    val directDeltaResults = directDeltaIt.map(r => r.getHistogram(1).toString).toBuffer
+
+    // Reference: direct cumulative histogram rate
+    val directCumIt = chunkedWindowItHist(cumulData, cumulRV,
+      new HistRateFunction(), windowSize, step)
+    val directCumResults = directCumIt.map(r => r.getHistogram(1).toString).toBuffer
+
+    val toggler = new CumlDeltaTogglerChunkedFunction[TransientHistRow](
+      new HistRateFunction(),
+      new RateOverDeltaChunkedFunctionH())
+
+    // Toggler on delta RV → should produce same output as RateOverDeltaChunkedFunctionH
+    val togglerDeltaIt = chunkedWindowItHist(deltaData, deltaRV,
+      toggler,
+      windowSize, step)
+    val togglerDeltaResults = togglerDeltaIt.map(r => r.getHistogram(1).toString).toBuffer
+
+    // Toggler on cumulative RV → should produce same output as HistRateFunction
+    val togglerCumIt = chunkedWindowItHist(cumulData, cumulRV,
+      toggler,
+      windowSize, step)
+    val togglerCumResults = togglerCumIt.map(r => r.getHistogram(1).toString).toBuffer
+
+    togglerDeltaResults shouldEqual directDeltaResults
+    togglerCumResults   shouldEqual directCumResults
+  }
+
+  it("CumlDeltaToggler with histogram rate+max/min should route delta to DeltaRateAndMinMaxOverTimeFuncHD " +
+      "and cumulative to CumulativeHistRateAndMinMaxFunction") {
+    // Delta histogram with min/max columns (histMaxMinDS: colIds timestamp=0,count=1,sum=2,hist=3,min=4,max=5)
+    val (deltaData, deltaRV) = MMD.histMaxMinRV(defaultStartTS, pubFreq, numSamples = 50)
+
+    // Cumulative histogram with min/max columns (cumulHistDS: same layout)
+    val (cumulData, cumulRV) = MMD.cumulHistRV(defaultStartTS, pubFreq, numSamples = 50)
+
+    val windowSize = 10
+    val step       = 5
+
+    val row = new TransientHistMaxMinRow()
+
+    // Reference: direct delta rate+min/max
+    val directDeltaIt = chunkedWindowItHist(deltaData, deltaRV,
+      new DeltaRateAndMinMaxOverTimeFuncHD(5, 4), windowSize, step, row)
+    val directDeltaResults = directDeltaIt.map { r =>
+      (r.getHistogram(1).toString, r.getDouble(2), r.getDouble(3))
+    }.toBuffer
+
+    // Reference: direct cumulative rate+min/max
+    val directCumIt = chunkedWindowItHist(cumulData, cumulRV,
+      new CumulativeHistRateAndMinMaxFunction(5, 4),
+      windowSize, step, new TransientHistMaxMinRow())
+    val directCumResults = directCumIt.map { r =>
+      (r.getHistogram(1).toString, r.getDouble(2), r.getDouble(3))
+    }.toBuffer
+
+    val toggler = new CumlDeltaTogglerChunkedFunction[TransientHistMaxMinRow](
+      new CumulativeHistRateAndMinMaxFunction(5, 4),
+      new DeltaRateAndMinMaxOverTimeFuncHD(5, 4))
+
+    // Toggler on delta RV
+    val togglerDeltaIt = chunkedWindowItHist(deltaData, deltaRV,
+      toggler,
+      windowSize, step, new TransientHistMaxMinRow())
+    val togglerDeltaResults = togglerDeltaIt.map { r =>
+      (r.getHistogram(1).toString, r.getDouble(2), r.getDouble(3))
+    }.toBuffer
+
+    // Toggler on cumulative RV
+    val togglerCumIt = chunkedWindowItHist(cumulData, cumulRV,
+      toggler,
+      windowSize, step, new TransientHistMaxMinRow())
+    val togglerCumResults = togglerCumIt.map { r =>
+      (r.getHistogram(1).toString, r.getDouble(2), r.getDouble(3))
+    }.toBuffer
+
+    togglerDeltaResults shouldEqual directDeltaResults
+    togglerCumResults   shouldEqual directCumResults
   }
 
 }
